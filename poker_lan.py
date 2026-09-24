@@ -807,7 +807,8 @@ class Client:
 
 class WebSession:
     """Un navegador tiene un cliente TCP propio: conserva las reglas y privacidad existentes."""
-    def __init__(self, port, name, pin, token=None):
+    def __init__(self, port, name, pin, token=None, room=None):
+        self.room = room
         self.client = Client("127.0.0.1", port, {"type": "hello", "name": name, "pin": pin, "token": token})
         self.name, self.token = name, token
         self.lock = threading.Lock()
@@ -845,6 +846,7 @@ class WebSession:
             if state:
                 state["seconds"] = max(0, state["seconds"] - (time.monotonic() - self.received_at))
             result = {"state": state, "online": self.online, "errors": list(self.errors)}
+            result["room"] = self.room
             self.errors.clear()
             return result
 
@@ -859,6 +861,9 @@ class WebHub:
         self.poker_server = poker_server
         self.public_url = public_url.rstrip("/")
         self.sessions = {}
+        self.rooms = {}
+        self.entry_lock = threading.Lock()
+        self.attempts = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         hub = self
@@ -912,10 +917,12 @@ class WebHub:
                     _, session = self.session()
                     if session is None or session.expired:
                         self.reply(401, {"error": "Entra a la mesa para jugar."})
+                    elif self.headers.get("X-Room") and self.headers["X-Room"] != (session.room or {}).get("code", ""):
+                        self.reply(409, {"error": "Este navegador está en otra mesa. Sal de ella antes de cambiar."})
                     else:
                         self.reply(200, session.payload())
                 elif path == "/api/info":
-                    self.reply(200, {"version": 5, "starting_stack": hub.poker_server.game.starting_stack})
+                    self.reply(200, {"version": 6, "rooms": True, "starting_stack": hub.poker_server.game.starting_stack})
                 else:
                     self.reply(404, {"error": "No encontrado."})
 
@@ -937,6 +944,12 @@ class WebHub:
                         raise ValueError("Solicitud inválida.")
                     path = urlsplit(self.path).path
                     sid, session = self.session()
+                    if path in ("/api/rooms/create", "/api/rooms/join"):
+                        with hub.entry_lock:
+                            sid, session = self.session()
+                            result, new_sid = hub.enter_room(path.endswith("create"), msg, sid, session)
+                        self.reply(200, result, cookie=new_sid)
+                        return
                     if path == "/api/join":
                         if session and session.online and not session.expired:
                             self.reply(200, session.payload())
@@ -968,6 +981,9 @@ class WebHub:
                     if not session or not session.online or session.expired:
                         self.reply(401, {"error": "Tu conexión terminó. Vuelve a entrar."})
                         return
+                    if session.room and self.headers.get("X-Room") != session.room["code"]:
+                        self.reply(409, {"error": "La sesión pertenece a otra mesa. Recarga la página."})
+                        return
                     session.last_seen = time.monotonic()
                     if path == "/api/leave":
                         session.expired = True
@@ -989,6 +1005,74 @@ class WebHub:
         self.thread = threading.Thread(target=self.http.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
         self.cleanup_thread = threading.Thread(target=self.cleanup, daemon=True)
 
+    def enter_room(self, create, msg, sid, session):
+        """Serialized admission: room passwords and state never cross table boundaries."""
+        name, pin = msg.get("name", ""), msg.get("pin", "")
+        code, title = msg.get("code", ""), msg.get("title", "")
+        if not all(isinstance(v, str) for v in (name, pin, code, title)):
+            raise ValueError("Revisa los datos de la mesa.")
+        name, title, code = " ".join(name.split()), " ".join(title.split()), code.strip().upper()
+        if not 1 <= len(name) <= 24 or not 1 <= len(pin) <= 128 or len(code) > 8:
+            raise ValueError("Escribe tu nombre (hasta 24 letras) y la clave de la mesa.")
+        if session and session.online and not session.expired:
+            if not create and session.room and session.room["code"] == code:
+                return session.payload(), sid
+            raise ValueError("Ya estás en una mesa en este navegador. Vuelve a la página principal y pulsa Salir antes de cambiar.")
+        now = time.monotonic()
+        if create:
+            if not 1 <= len(title) <= 40 or len(pin) < 6:
+                raise ValueError("Pon un nombre de mesa (hasta 40 letras) y una clave de al menos 6 caracteres.")
+            if len(self.rooms) >= 12:
+                raise ValueError("Hay 12 mesas abiertas. Espera a que se libere una.")
+            code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+            while code in self.rooms:
+                code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+            server = Server(0, pin, online=True)
+            server.start()
+            room = {"server": server, "title": title, "code": code, "touched": now}
+            self.rooms[code] = room
+        else:
+            room = self.rooms.get(code)
+            if room is None:
+                raise ValueError("Código o clave incorrectos; la mesa también puede haber caducado.")
+            attempts = self.attempts.setdefault(code, deque())
+            while attempts and now - attempts[0] > 60:
+                attempts.popleft()
+            if len(attempts) >= 20:
+                raise ValueError("Demasiados intentos para esta mesa. Espera un minuto.")
+            if not secrets.compare_digest(pin.encode(), room["server"].pin.encode()):
+                attempts.append(now)
+                raise ValueError("Código o clave incorrectos; la mesa también puede haber caducado.")
+        with self.lock:
+            for old_sid, old in list(self.sessions.items()):
+                if old.expired and old_sid != sid and len(self.sessions) >= 256:
+                    del self.sessions[old_sid]
+            full = len(self.sessions) >= 256 and sid not in self.sessions
+        if full:
+            if create:
+                self.rooms.pop(code)["server"].stop()
+            raise ValueError("Servidor ocupado. Intenta de nuevo más tarde.")
+        token = session.token if session and session.room and session.room["code"] == code else None
+        candidate = WebSession(room["server"].port, name, pin, token, {"code": code, "title": room["title"]})
+        if not candidate.ready.wait(6) or not candidate.online:
+            errors = candidate.payload()["errors"]
+            candidate.close()
+            if create:
+                self.rooms.pop(code)["server"].stop()
+            if token and errors and "sesión anterior" in errors[-1]:
+                with self.lock:
+                    self.sessions.pop(sid, None)
+                raise ValueError("Tu asiento fue liberado. Pulsa Entrar otra vez.")
+            raise ValueError(errors[-1] if errors else "No se pudo entrar. Reintenta.")
+        new_sid = secrets.token_urlsafe(32)
+        with self.lock:
+            if session:
+                session.close()
+            self.sessions.pop(sid, None)
+            self.sessions[new_sid] = candidate
+        room["touched"] = now
+        return candidate.payload(), new_sid
+
     def start(self):
         self.thread.start()
         self.cleanup_thread.start()
@@ -1007,6 +1091,16 @@ class WebHub:
                         hub_session = self.sessions.get(sid)
                         if hub_session is session:
                             del self.sessions[sid]
+            with self.entry_lock:
+                for code, room in list(self.rooms.items()):
+                    with self.lock:
+                        occupied = any(s.room and s.room["code"] == code and s.online and not s.expired for s in self.sessions.values())
+                    if occupied:
+                        room["touched"] = time.monotonic()
+                    elif time.monotonic() - room["touched"] > 1800:
+                        del self.rooms[code]
+                        self.attempts.pop(code, None)
+                        room["server"].stop()
 
     def stop(self):
         self.stop_event.set()
@@ -1016,6 +1110,11 @@ class WebHub:
             for session in self.sessions.values():
                 session.close()
         self.thread.join(timeout=2)
+        self.cleanup_thread.join(timeout=2)
+        with self.entry_lock:
+            for room in self.rooms.values():
+                room["server"].stop()
+            self.rooms.clear()
 
 
 MOBILE_HTML = r"""<!doctype html>
@@ -1046,19 +1145,36 @@ MOBILE_HTML = r"""<!doctype html>
 const $=id=>document.getElementById(id), money=n=>'S/ '+(Math.abs(n)/100).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}), signed=n=>(n<0?'−':n>0?'+':'')+money(n);
 let state=null, lastState=null, online=false, busy=false, polling=false, eventCursor=null, scope='', announcementQueue=[], announcementTimer=null, toastTimer=null, activePane='chat', chatID=0, stateAt=0, turnKey='', positions=new Map(), animScope='', pollFailures=0;
 const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+let roomMode='join', roomCode=(new URLSearchParams(location.search).get('mesa')||'').trim().toUpperCase(), roomTitle='', switching=false;
+const roomFields=node('div');
+const roomTabs=node('div');roomTabs.style.cssText='display:flex;gap:8px;margin-bottom:12px';
+for(const [mode,label] of [['join','Entrar con código'],['create','Crear mesa']]){const b=node('button',mode==='join'?'gold':'',label);b.type='button';b.style.cssText='margin-top:0;flex:1;padding:10px;font-size:13px';b.onclick=()=>{roomMode=mode;codeLabel.hidden=codeInput.hidden=mode==='create';titleLabel.hidden=titleInput.hidden=mode!=='create';$('joinBtn').textContent=mode==='create'?'Crear mi mesa →':'Entrar a esta mesa →';pinInput.minLength=mode==='create'?6:1;for(const x of roomTabs.children)x.classList.toggle('gold',x===b)};roomTabs.append(b)}
+const codeLabel=node('label','','Código de la mesa');codeLabel.htmlFor='roomCode';const codeInput=node('input');codeInput.id='roomCode';codeInput.maxLength=8;codeInput.placeholder='Ejemplo: AB7K9M2Q';codeInput.value=roomCode;codeInput.autocomplete='off';codeInput.style.textTransform='uppercase';
+const titleLabel=node('label','','Nombre de tu mesa');titleLabel.htmlFor='roomTitle';const titleInput=node('input');titleInput.id='roomTitle';titleInput.maxLength=40;titleInput.placeholder='Por ejemplo: Los amigos';titleLabel.hidden=titleInput.hidden=true;
+roomFields.append(roomTabs,codeLabel,codeInput,titleLabel,titleInput);$('joinForm').insertBefore(roomFields,document.querySelector('label[for="pin"]'));
+const pinInput=$('pin');pinInput.required=true;pinInput.placeholder='Clave privada de esta mesa';$('joinBtn').textContent='Entrar a esta mesa →';
+document.querySelector('.login-box p').textContent='Crea tu propia mesa o entra con el código y la clave que te compartieron.';
+document.querySelector('.login-foot').lastChild.textContent='Salas privadas · Sin instalar aplicaciones';
+const invitation=node('section');invitation.style.cssText='margin:12px 4px;padding:14px;border:1px solid #72603e;border-radius:12px;overflow-wrap:anywhere';
+invitation.append(node('strong','','Invita a tu mesa'),node('div','muted','Comparte el enlace y envía la clave por separado.'));
+const invitationCode=node('div');invitationCode.style.cssText='font-size:22px;color:var(--gold);letter-spacing:3px;margin:8px 0';
+const inviteLink=node('input');inviteLink.readOnly=true;inviteLink.setAttribute('aria-label','Enlace de invitación');inviteLink.style.width='100%';
+const copyInvite=node('button','','Copiar invitación');copyInvite.type='button';copyInvite.style.marginTop='8px';copyInvite.onclick=async()=>{try{await navigator.clipboard.writeText(inviteLink.value);showToast('Enlace copiado. Comparte la clave por separado.')}catch{inviteLink.focus();inviteLink.select();showToast('Mantén pulsado el enlace y elige Copiar.')}};
+invitation.append(invitationCode,inviteLink,copyInvite);document.querySelector('.main').prepend(invitation);invitation.hidden=true;
+function updateRoom(room){if(!room)return;if(roomCode!==room.code){state=null;lastState=null;eventCursor=null;chatID=-1;scope='';animScope='';turnKey='';announcementQueue=[];dismiss(false)}roomCode=room.code;roomTitle=room.title;codeInput.value=roomCode;invitation.hidden=false;invitationCode.textContent=roomCode;inviteLink.value=location.origin+'/?mesa='+encodeURIComponent(roomCode);document.querySelector('.table-head h2').textContent=roomTitle;history.replaceState(null,'','?mesa='+encodeURIComponent(roomCode))}
 function node(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
 function card(code){let e=node('span','card');if(!code){e.classList.add('blank');e.textContent='♠';return e}if(code==='??'){e.classList.add('back');e.textContent='♠';return e}if('dh'.includes(code[1]))e.classList.add('red');e.append(node('span','',code[0]==='T'?'10':code[0]),node('span','suit',({c:'♣',d:'♦',h:'♥',s:'♠'})[code[1]]));return e}
 function showToast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,5500)}
-async function api(path,data){const options={credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout?AbortSignal.timeout(8000):undefined};if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-Poker':'1'};options.body=JSON.stringify(data)}const r=await fetch(path,options);const body=await r.json();if(!r.ok){const err=new Error(body.error||'No se pudo completar la acción');err.status=r.status;throw err}return body}
+async function api(path,data){const options={credentials:'same-origin',cache:'no-store',headers:roomCode?{'X-Room':roomCode}:{},signal:AbortSignal.timeout?AbortSignal.timeout(10000):undefined};if(data!==undefined){options.method='POST';Object.assign(options.headers,{'Content-Type':'application/json','X-Poker':'1'});options.body=JSON.stringify(data)}const r=await fetch(path,options);const body=await r.json();if(!r.ok){const err=new Error(body.error||'No se pudo completar la acción');err.status=r.status;throw err}return body}
 function cents(text){text=text.trim().replace(',','.');if(!/^\d+(\.\d{1,2})?$/.test(text))throw new Error('Usa soles y hasta dos decimales. Ejemplo: 0.50');const [whole,fraction='']=text.split('.');const n=Number(whole)*100+Number(fraction.padEnd(2,'0'));if(!Number.isSafeInteger(n)||n>100000000000)throw new Error('Importe demasiado grande');return n}
-function showLogin(){online=false;$('game').hidden=true;$('login').hidden=false;$('leave').hidden=true;$('network').textContent='Red local';state=null;eventCursor=null;scope='';animScope='';announcementQueue=[];dismiss(false)}
-function accept(payload){online=payload.online;pollFailures=0;for(const error of payload.errors||[])showToast(error);if(payload.state){lastState=state;state=payload.state;stateAt=performance.now();$('login').hidden=true;$('game').hidden=false;$('leave').hidden=false;render();receiveEvents()}if(!online){$('network').textContent='Sin conexión';showToast('La conexión terminó. Vuelve a entrar para recuperar tu asiento.');controls()} }
-$('joinForm').addEventListener('submit',async e=>{e.preventDefault();$('joinBtn').disabled=true;try{const p=await api('/api/join',{name:$('name').value.trim(),pin:$('pin').value});try{localStorage.setItem('pokerName',$('name').value.trim())}catch{}accept(p)}catch(err){showToast(err.message)}finally{$('joinBtn').disabled=false}});
-async function poll(){if(polling)return;polling=true;try{accept(await api('/api/state'))}catch(err){if(err.status===401){if(state)showToast('La sesión terminó. Vuelve a entrar a la mesa.');showLogin()}else{pollFailures++;$('network').textContent='Reconectando…';if(pollFailures>=3){online=false;controls();showToast('No se puede contactar con la Mac. Revisa el Wi-Fi.')}}}finally{polling=false}}
+function showLogin(){online=false;$('game').hidden=true;$('login').hidden=false;$('leave').hidden=true;$('network').textContent='Mesas privadas';state=null;lastState=null;chatID=-1;eventCursor=null;scope='';animScope='';turnKey='';announcementQueue=[];dismiss(false)}
+function accept(payload){updateRoom(payload.room);online=payload.online;pollFailures=0;for(const error of payload.errors||[])showToast(error);if(payload.state){lastState=state;state=payload.state;stateAt=performance.now();$('login').hidden=true;$('game').hidden=false;$('leave').hidden=false;render();receiveEvents()}if(!online){$('network').textContent='Sin conexión';showToast('La conexión terminó. Vuelve a entrar para recuperar tu asiento.');controls()} }
+$('joinForm').addEventListener('submit',async e=>{e.preventDefault();if(switching)return;switching=true;$('joinBtn').disabled=true;try{const p=await api('/api/rooms/'+(roomMode==='create'?'create':'join'),{name:$('name').value.trim(),pin:pinInput.value,code:codeInput.value.trim(),title:titleInput.value.trim()});try{localStorage.setItem('pokerName',$('name').value.trim())}catch{}accept(p);pinInput.value=''}catch(err){showToast(err.message)}finally{switching=false;$('joinBtn').disabled=false}});
+async function poll(){if(polling||switching)return;polling=true;try{const p=await api('/api/state');if(!switching)accept(p)}catch(err){if(switching)return;if(err.status===401||err.status===409){if(state||err.status===409)showToast(err.status===409?err.message:'La sesión terminó. Vuelve a entrar a la mesa.');showLogin()}else{pollFailures++;$('network').textContent='Reconectando…';if(pollFailures>=3){online=false;controls();showToast('No se puede contactar con el servidor. Revisa tu conexión.')}}}finally{polling=false}}
 async function command(cmd){if(!online||!state)return;busy=true;controls();try{await api('/api/command',cmd);await poll()}catch(err){showToast(err.message);if(err.status===401)showLogin()}finally{busy=false;controls()}}
 function act(action){if(!state||!state.options||state.turn!==state.you)return;const msg={type:'action',action,revision:state.revision};try{if(action==='raise')msg.amount=cents($('amount').value);command(msg)}catch(err){showToast(err.message)}}
 $('fold').onclick=()=>act('fold');$('call').onclick=()=>act('call');$('allin').onclick=()=>act('allin');$('raise').onclick=()=>act('raise');$('start').onclick=()=>command({type:'start'});$('reset').onclick=()=>{if(confirm('¿Empezar otra partida con '+money(state.starting_stack)+' virtuales por jugador?'))command({type:'reset',revision:state.revision})};
-$('leave').onclick=async()=>{if(!confirm('Si sales, termina la partida para todos. ¿Salir?'))return;try{await api('/api/leave',{})}catch{}showLogin()};
+$('leave').onclick=async()=>{if(!confirm('Si sales, termina la partida de esta mesa. Los demás podrán empezar otra. ¿Salir?'))return;switching=true;try{await api('/api/leave',{});showLogin();roomCode='';history.replaceState(null,'',location.pathname);codeInput.value=''}catch(err){showToast(err.message)}finally{switching=false}};
 $('chatForm').onsubmit=async e=>{e.preventDefault();const text=$('chatInput').value.trim();if(!text)return;try{await api('/api/command',{type:'chat',text});$('chatInput').value='';await poll()}catch(err){showToast(err.message)}};
 document.querySelectorAll('[data-pane]').forEach(b=>b.onclick=()=>{activePane=b.dataset.pane;document.querySelectorAll('[data-pane]').forEach(x=>x.classList.toggle('active',x===b));for(const p of ['chat','results','profiles'])$('pane-'+p).hidden=p!==activePane;if(activePane==='chat')$('unread').textContent=''});
 document.querySelectorAll('[data-quick]').forEach(b=>b.onclick=()=>{if(!state?.options?.raise)return;const o=state.options;let val=o.min;const q=b.dataset.quick;if(q==='half')val=state.current+Math.floor(state.pot/2);if(q==='pot')val=state.current+state.pot;if(q==='100')val=10000;val=Math.max(o.min,Math.min(o.max,val));$('amount').value=(Math.min(o.max,val)/100).toFixed(2)});
@@ -1676,6 +1792,71 @@ def run_tests():
     import unittest
 
     class PokerTests(unittest.TestCase):
+        def test_private_rooms_isolation_passwords_switching_and_host(self):
+            import http.client
+            server = Server(0)
+            server.start()
+            hub = WebHub(server, 0)
+            hub.start()
+            def request(path, body=None, cookie="", code=""):
+                conn = http.client.HTTPConnection("127.0.0.1", hub.port, timeout=8)
+                headers = {"Cookie": cookie, "X-Room": code, "X-Poker": "1", "Content-Type": "application/json"}
+                conn.request("POST" if body is not None else "GET", path, json.dumps(body) if body is not None else None, headers)
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read()), (response.getheader("Set-Cookie") or "").split(";")[0]
+                conn.close()
+                return result
+            def wait(cookie, code, check):
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    status, payload, _ = request("/api/state", cookie=cookie, code=code)
+                    if status == 200 and check(payload["state"]):
+                        return payload["state"]
+                    threading.Event().wait(.03)
+                self.fail("No llegó el estado de la sala")
+            try:
+                body = {"name": "Ana", "title": "Amigos", "pin": "secreto1"}
+                status, a, ca = request("/api/rooms/create", body)
+                self.assertEqual(status, 200)
+                code_a = a["room"]["code"]
+                self.assertEqual(len(code_a), 8)
+                self.assertTrue(a["state"]["host"])
+                status, b, cb = request("/api/rooms/create", {**body, "pin": "secreto2"})
+                self.assertEqual(status, 200)
+                code_b = b["room"]["code"]
+                self.assertNotEqual(code_a, code_b)
+                self.assertNotIn("secreto", json.dumps(a))
+                self.assertEqual(request("/api/rooms/join", {"name": "Beto", "pin": "secreto2", "code": code_a})[0], 400)
+                self.assertEqual(request("/api/rooms/join", {"name": "Beto", "pin": "secreto1", "code": "XXXXXXXX"})[0], 400)
+                status, c, cc = request("/api/rooms/join", {"name": "Beto", "pin": "secreto1", "code": code_a.lower()})
+                self.assertEqual(status, 200)
+                self.assertFalse(c["state"]["host"])
+                request("/api/command", {"type": "chat", "text": "Solo mesa A"}, ca, code_a)
+                wait(cc, code_a, lambda s: bool(s["chat"]))
+                self.assertEqual(request("/api/state", cookie=cb, code=code_b)[1]["state"]["chat"], [])
+                self.assertEqual(request("/api/state", cookie=ca, code=code_b)[0], 409)
+                self.assertEqual(request("/api/command", {"type": "start"}, ca, code_b)[0], 409)
+                self.assertEqual(request("/api/rooms/create", body, ca)[0], 400)
+                request("/api/command", {"type": "start"}, ca, code_a)
+                started = wait(cc, code_a, lambda s: s["active"])
+                self.assertEqual(started["players"][0]["cards"], ["??", "??"])
+                self.assertFalse(request("/api/state", cookie=cb, code=code_b)[1]["state"]["active"])
+                request("/api/leave", {}, ca, code_a)
+                wait(cc, code_a, lambda s: s["host"] and s["ended"])
+                self.assertFalse(request("/api/state", cookie=cb, code=code_b)[1]["state"]["ended"])
+                status, switched, new_cookie = request("/api/rooms/join", {"name": "Carlos", "pin": "secreto2", "code": code_b}, ca)
+                self.assertEqual(status, 200)
+                self.assertEqual(switched["room"]["code"], code_b)
+                self.assertNotEqual(ca, new_cookie)
+                self.assertEqual(request("/api/state", cookie=ca)[0], 401)
+                self.assertEqual(request("/api/command", {"type": "start"}, new_cookie, code_a)[0], 409)
+                for _ in range(20):
+                    request("/api/rooms/join", {"name": "X", "pin": "mal", "code": code_a})
+                self.assertIn("intentos", request("/api/rooms/join", {"name": "X", "pin": "secreto1", "code": code_a})[1]["error"])
+            finally:
+                hub.stop()
+                server.stop()
+
         def test_online_host_transfer_and_empty_table_recovery(self):
             server = Server(0, online=True)
             self.assertEqual(server.listener.getsockname()[0], "127.0.0.1")
@@ -2227,7 +2408,7 @@ def main():
     parser.add_argument("--desktop", action="store_true", help="Usar la interfaz Tkinter anterior (opcional)")
     parser.add_argument("--web-port", type=int, default=int(os.environ.get("PORT", "5051")), help="Puerto HTTP; también admite PORT")
     parser.add_argument("--online", action="store_true", help="Servidor permanente; transfiere el anfitrión al desconectarse")
-    parser.add_argument("--public-url", default=os.environ.get("POKER_PUBLIC_URL", ""), help="Origen HTTPS del alojamiento, sin rutas")
+    parser.add_argument("--public-url", default=os.environ.get("POKER_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", ""), help="Origen HTTPS del alojamiento, sin rutas")
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--pin", default=os.environ.get("POKER_PIN", ""), help="Clave compartida de mesa; también admite POKER_PIN")
     args = parser.parse_args()
