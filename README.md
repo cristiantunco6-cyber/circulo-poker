@@ -185,7 +185,7 @@ La conexión opcional usa la [Responses API de OpenAI](https://developers.openai
 
 No se ha contratado ni activado un servicio de pago. Una suscripción a ChatGPT no configura esta conexión. La IA puede tener coste según el proveedor/modelo; configura los límites de gasto en tu cuenta antes de activarla. Se envía exclusivamente el texto dirigido a @crupier, sin historial de la mesa, nombres, cartas, claves ni sesiones. Se solicitan respuestas breves con `store: false`; consulta la política del proveedor para la retención aplicable. El juego limita a una consulta cada ocho segundos y treinta por hora por mesa; no sustituye un límite de gasto de cuenta. El hilo del juego no espera a la IA; si falla, responde el bot local. La IA no tiene herramientas ni acceso a modificar saldos o resultados.
 
-Validación: `python3 poker_lan.py --test` ejecuta 32 pruebas, incluidas pagos, ases, dobles, banca humana por red, privacidad, desconexiones, aislamiento de mesas y regresión de póker. La conexión a IA requiere credenciales y no ha sido probada contra un servicio real.
+Validación: `python3 poker_lan.py --test` ejecuta 35 pruebas, incluidas pagos, ases, dobles, banca humana por red, privacidad, desconexiones, aislamiento de mesas y regresión de póker. La conexión a IA requiere credenciales y no ha sido probada contra un servicio real.
 
 
 ## Actualización de efectos y protección (versión 8)
@@ -209,3 +209,8 @@ Esto reduce superficies de ataque; no constituye una garantía de invulnerabilid
 5. Entra en una mesa nueva y escribe `@crupier hola`. Una respuesta etiquetada `El Causa · IA` confirma que respondió el proveedor. Si aparece `bot local`, revisa la configuración y saldo; no pegues claves en el juego.
 
 La IA real sigue pendiente: el propietario confirmó que todavía no tiene clave. No se crearon cuentas de pago ni se configuraron credenciales. El transporte se probó con una respuesta simulada, no con una llamada facturada.
+
+
+## Endurecimiento v9
+
+Nombres normalizados y reservados, importes validados contra el saldo antes del motor, estilos con nonce sin unsafe-inline y registros de entradas rechazadas sin secretos. Se conservan las animaciones y el diseño. Consulta `AUDITORIA_SEGURIDAD.md` para alcance, pruebas y límites. La IA real sigue pendiente de la clave privada de API.

@@ -26,6 +26,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
@@ -41,6 +42,22 @@ SUITS = "cdhs"
 SYMBOLS = dict(zip(SUITS, "♣♦♥♠"))
 HAND_NAMES = ["carta alta", "pareja", "doble pareja", "trío", "escalera",
               "color", "full house", "póker", "escalera de color"]
+
+
+def safe_label(value, limit, reserved=False):
+    """Normalize display labels before comparing identities; never coerce objects."""
+    if not isinstance(value, str) or len(value) > limit * 4:
+        raise ValueError("Nombre inválido o demasiado largo.")
+    value = unicodedata.normalize("NFKC", value)
+    value = " ".join("".join(c for c in value if c.isspace() or
+        (c.isprintable() and not unicodedata.category(c).startswith("C"))).split())
+    if not 1 <= len(value) <= limit:
+        raise ValueError(f"Escribe un nombre de entre 1 y {limit} caracteres.")
+    key = "".join(c for c in unicodedata.normalize("NFKD", value.casefold())
+                  if not unicodedata.combining(c))
+    if reserved and key.startswith(("el causa", "sistema", "server", "admin", "dealer", "bot", "soporte", "moderador", "crupier")):
+        raise ValueError("Ese nombre está reservado; elige otro.")
+    return value
 
 
 def money(cents, signed=False):
@@ -258,9 +275,7 @@ class Game:
         vacancy = next((p.pid for p in self.players if not p.connected), None) if reuse and not self.active else None
         if len(self.players) >= MAX_PLAYERS and vacancy is None:
             raise ValueError("Mesa llena (máximo 10 asientos por sesión).")
-        name = " ".join(str(name).split())[:24]
-        if not name:
-            raise ValueError("Escribe un nombre.")
+        name = safe_label(name, 24, reserved=True)
         if any(p.pid != vacancy and p.name.casefold() == name.casefold() for p in self.players):
             raise ValueError("Ese nombre ya está en uso; elige otro.")
         p = Player(len(self.players) if vacancy is None else vacancy, name, stack=self.starting_stack)
@@ -876,6 +891,12 @@ class Server:
             self.broadcast()
             return
         kind = msg.get("type")
+        if kind == "action" and "amount" in msg:
+            amount = msg["amount"]
+            # Bounds follow the actual bankroll: accumulated winnings remain usable.
+            p = self.game.player(peer.pid)
+            if type(amount) is not int or not 0 <= amount <= min(2**53 - 1, p.stack + p.bet):
+                raise ValueError("Importe fuera del rango permitido por tu saldo.")
         if kind == "ping":
             self.send(peer, {"type": "pong"})
             return
@@ -1215,14 +1236,14 @@ class WebHub:
             def reply(self, status, data, cookie=None, html=False):
                 nonce = secrets.token_urlsafe(24)
                 if html:
-                    data = data.replace("<script>", f'<script nonce="{nonce}">')
+                    data = data.replace("<script>", f'<script nonce="{nonce}">').replace("<style>", f'<style nonce="{nonce}">')
                 raw = data.encode("utf-8") if html else json.dumps(data, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8" if html else "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Content-Security-Policy", f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'")
+                self.send_header("Content-Security-Policy", f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'")
                 self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=()")
@@ -1269,7 +1290,7 @@ class WebHub:
                     else:
                         self.reply(200, session.payload())
                 elif path == "/api/info":
-                    self.reply(200, {"version": 8, "rooms": True, "starting_stack": hub.poker_server.game.starting_stack})
+                    self.reply(200, {"version": 9, "rooms": True, "starting_stack": hub.poker_server.game.starting_stack})
                 else:
                     self.reply(404, {"error": "No encontrado."})
 
@@ -1306,7 +1327,12 @@ class WebHub:
                     if path in ("/api/rooms/create", "/api/rooms/join"):
                         with hub.entry_lock:
                             sid, session = self.session()
-                            result, new_sid = hub.enter_room(path.endswith("create"), msg, sid, session)
+                            try:
+                                result, new_sid = hub.enter_room(path.endswith("create"), msg, sid, session)
+                            except ValueError:
+                                print(json.dumps({"event": "admission_rejected", "peer": self.client_address[0],
+                                                  "time": int(time.time())}), file=sys.stderr, flush=True)
+                                raise
                         self.reply(200, result, cookie=new_sid)
                         return
                     if path == "/api/join":
@@ -1373,7 +1399,8 @@ class WebHub:
         code, title = msg.get("code", ""), msg.get("title", "")
         if not all(isinstance(v, str) for v in (name, pin, code, title)):
             raise ValueError("Revisa los datos de la mesa.")
-        name, title, code = " ".join(name.split()), " ".join(title.split()), code.strip().upper()
+        name, code = safe_label(name, 24, reserved=True), code.strip().upper()
+        title = safe_label(title, 40) if create else title
         if not 1 <= len(name) <= 24 or not 1 <= len(pin) <= 128 or len(code) > 8:
             raise ValueError("Escribe tu nombre (hasta 24 letras) y la clave de la mesa.")
         if session and session.online and not session.expired:
@@ -1486,6 +1513,10 @@ MOBILE_HTML = r"""<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#071d1b"><title>Círculo · Póker & Blackjack</title>
 <style>
+.table-head .eyebrow{margin-bottom:7px}#results{max-height:420px;overflow:auto}#profiles{max-height:460px;overflow:auto}
+.room-tabs{display:flex;gap:8px;margin-bottom:12px}.room-tabs button{margin-top:0;flex:1;padding:10px;font-size:13px}
+.invitation{margin:12px 4px;padding:14px;border:1px solid #72603e;border-radius:12px;overflow-wrap:anywhere}
+.invitation-code{font-size:22px;color:var(--gold);letter-spacing:3px;margin:8px 0}
 :root{color-scheme:dark;--bg:#071310;--panel:#10241f;--gold:#edcb85;--text:#eff6f0;--muted:#9caf9f;--green:#a1ecc0;--line:#2b4234}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 45% 0,#18352b 0,#091712 48%,#050c09 100%);color:var(--text);font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100dvh}button,input{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:12px;padding:12px 18px;color:var(--text);background:#1c342b;font-weight:650;min-height:44px}button:hover:not(:disabled){filter:brightness(1.16)}button:disabled{opacity:.38;cursor:default}button.gold{background:linear-gradient(135deg,#f0d99d,#be9858);color:#20190d;border-color:#e9c88a}button.danger{color:#ffc0ae;background:#432721;border-color:#644037}button.quiet{background:transparent}input{border:1px solid #42604a;background:#0b1913;color:white;border-radius:10px;padding:12px;min-width:0;outline:none}input:focus-visible,button:focus-visible{outline:2px solid var(--gold);outline-offset:3px}a{color:var(--gold)}[hidden]{display:none!important}.muted{color:var(--muted)}.eyebrow{font-size:11px;letter-spacing:3px;color:var(--gold);text-transform:uppercase}h1,h2,h3,p{margin:0}header{max-width:1360px;margin:auto;padding:24px 32px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #ffffff10}.brand{display:flex;gap:12px;align-items:center}.brand-mark{font:44px Georgia;color:var(--gold)}.brand h1{font:25px Georgia,serif;letter-spacing:5px}.brand p{font-size:10px;letter-spacing:2px;color:var(--muted);margin-top:4px}.connection{font-size:12px;color:var(--green);display:flex;gap:8px;align-items:center}.dot{background:#8af0ad;border-radius:50%;width:7px;height:7px;box-shadow:0 0 12px #78e8ab}.top-actions{display:flex;align-items:center;gap:14px}.leave{font-size:12px;min-height:34px;padding:7px 12px}.layout{max-width:1360px;margin:0 auto;padding:18px 24px 30px;display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:24px}.main{min-width:0}.table-head{display:flex;justify-content:space-between;align-items:center;padding:0 10px}.table-head h2{font:24px Georgia;letter-spacing:.3px}.table-head .stakes{text-align:right;font-size:12px;color:var(--muted);line-height:1.8}.table-head strong{color:var(--gold)}.stage{height:660px;position:relative;isolation:isolate;overflow:hidden}.felt{position:absolute;left:50%;top:51%;width:min(69%,530px);aspect-ratio:1;border-radius:50%;transform:translate(-50%,-50%);background:radial-gradient(ellipse at 40% 30%,#24694e,#104632 60%,#073320);border:15px solid #493822;box-shadow:0 0 0 2px #b2985c,0 0 0 8px #171c13,0 0 0 10px #72603e,0 28px 65px #000a,inset 0 0 40px #021b10}.felt:before{content:"";position:absolute;inset:11px;border:1px solid #debd6a60;border-radius:50%}.felt:after{content:"C Í R C U L O";position:absolute;top:25%;width:100%;text-align:center;color:#c3d7b51a;font:23px Georgia;letter-spacing:6px}.dealer{position:absolute;left:50%;top:0;transform:translateX(-50%);display:flex;align-items:center;flex-direction:column;z-index:3}.dealer svg{width:54px;height:64px;filter:drop-shadow(0 5px 8px #0009)}.dealer span{font-size:9px;color:var(--gold);letter-spacing:2px;margin-top:3px}.dealer.dealing svg{animation:dealer-bob .45s ease-in-out 4}@keyframes dealer-bob{50%{transform:translateY(3px) rotate(4deg)}}.deck{position:absolute;top:31%;left:50%;transform:translateX(-50%);width:24px;height:33px;border-radius:4px;background:repeating-linear-gradient(45deg,#cfb374 0 2px,#213b30 2px 5px);border:2px solid #e3d3a4;box-shadow:3px 3px 0 #cfcca7;z-index:2}.center{position:absolute;left:50%;top:48%;width:54%;transform:translate(-50%,-50%);z-index:3;text-align:center}.pot-caption{font-size:9px;letter-spacing:2.5px;color:#c2d0bc}.pot{font-size:26px;color:#ffe2a4;font-weight:750;margin:2px 0 14px;text-shadow:0 2px 5px #0008}.board{display:flex;justify-content:center;gap:5px}.card{display:inline-flex;flex-direction:column;justify-content:space-between;align-items:flex-start;background:linear-gradient(140deg,#fffdf0,#eae3ce);color:#172d22;border-radius:6px;width:48px;height:68px;padding:4px 7px;box-shadow:0 3px 4px #0005;font:700 22px Georgia;border:1px solid #fff9;position:relative}.card .suit{align-self:flex-end;font-size:24px}.card.red{color:#b73830}.card.back{color:#e8c983;background:repeating-linear-gradient(45deg,#b3935544 0 1px,#172f26 1px 6px);border:1px solid #d1b879;align-items:center;justify-content:center}.card.blank{background:#052b1b60;border:1px dashed #99be9870;box-shadow:none;color:#96b39355;justify-content:center;align-items:center}.phase{font-size:10px;letter-spacing:2px;color:#bfccb4;margin-top:13px;text-transform:uppercase}.seat{position:absolute;transform:translate(-50%,-50%);width:126px;text-align:center;z-index:5;transition:left .4s,top .4s}.seat-main{background:linear-gradient(150deg,#1e3429,#101d16);border:1px solid #5c6747;border-radius:13px;padding:8px 6px;box-shadow:0 6px 15px #0006}.seat.turn .seat-main{border:2px solid var(--gold);box-shadow:0 0 22px #ecc47a33;padding:7px 5px}.seat.folded{opacity:.55}.seat.me .seat-main{background:linear-gradient(130deg,#315b40,#162d21)}.avatar{width:25px;height:25px;border:1px solid #ffffff20;background:#46563b;border-radius:50%;margin:0 auto 4px;display:grid;place-items:center;color:var(--gold);font-size:11px;font-weight:bold}.seat-name{white-space:nowrap;text-overflow:ellipsis;overflow:hidden;font-size:12px;font-weight:650}.seat-money{font-size:12px;color:var(--gold);margin-top:3px;font-variant-numeric:tabular-nums}.seat-role{font-size:9px;color:#b2c9a9;margin-top:3px;min-height:12px}.seat-cards{display:flex;justify-content:center;gap:3px;margin-bottom:-2px}.seat-cards .card{width:26px;height:35px;font-size:12px;padding:2px 4px;border-radius:4px}.seat-cards .card .suit{font-size:14px}.seat-bet{font-size:10px;margin-top:5px;color:#cfddc1;min-height:15px}.seat-bet:before{content:"●";color:var(--gold);margin-right:4px}.button-disc{position:absolute;right:-9px;top:42%;background:#efe6c7;color:#152519;border:2px solid #ad9e70;border-radius:50%;width:21px;height:21px;display:grid;place-items:center;font-size:10px;font-weight:bold}.chip-stack{position:absolute;left:50%;top:60%;transform:translate(-50%,-50%);display:flex;gap:5px;z-index:3}.chip{width:23px;height:23px;border:3px dashed #ffecb4;border-radius:50%;background:#b45b31;box-shadow:0 2px 0 #5a2717,0 4px 3px #0006}.chip:nth-child(2){background:#367758}.chip:nth-child(3){background:#334e80}.fly-chip{position:absolute;width:24px;height:24px;border:4px dashed #ffe7ae;background:#bd783f;border-radius:50%;z-index:20;box-shadow:0 3px 7px #0007;pointer-events:none}.fly-card{position:absolute;width:26px;height:36px;z-index:20;background:repeating-linear-gradient(45deg,#d9ba7844 0 2px,#1a3528 2px 5px);border:1px solid #d4ba7c;border-radius:4px;pointer-events:none}.turn-strip{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;margin:0 4px 9px;color:var(--muted)}.turn-strip b{color:var(--gold)}.timer{height:3px;background:#20362a;border-radius:3px;margin-bottom:13px}.timer i{display:block;height:100%;background:var(--gold);width:0;transition:width .3s}.control-panel{border:1px solid #4e5b3b;border-radius:18px;background:linear-gradient(130deg,#1b3023,#101d16);padding:16px}.hand-wallet{display:flex;justify-content:space-between;align-items:center;margin-bottom:13px}.hand-wallet h3{font-size:13px;color:var(--muted);font-weight:500}.wallet{font-size:22px;color:var(--gold);font-weight:700}.my-cards{display:flex;gap:6px}.my-cards .card{width:37px;height:51px;font-size:18px}.my-cards .card .suit{font-size:19px}.action-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.raise-line{display:flex;gap:8px;margin-top:10px}.raise-line label{display:flex;align-items:center;gap:6px;background:#091810;border:1px solid #3b5941;border-radius:11px;padding-left:12px;color:var(--gold);flex:1;min-width:0}.raise-line input{width:100%;border:0;background:transparent;padding-left:4px;font-size:17px}.raise-line button{flex:1}.quick{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.quick button{font-size:11px;min-height:30px;padding:5px 10px;border-radius:8px}.hint{font-size:11px;color:var(--muted);line-height:1.6;margin-top:8px}.host-controls{display:flex;gap:8px;margin-top:14px}.host-controls button{flex:1}.side{border:1px solid #ffffff15;border-radius:18px;background:#0e1d16;overflow:hidden;align-self:start;position:sticky;top:16px}.tabs{display:flex;border-bottom:1px solid #ffffff12}.tabs button{border:0;border-radius:0;padding:14px 8px;flex:1;font-size:12px;background:transparent;color:var(--muted)}.tabs button.active{color:var(--gold);box-shadow:inset 0 -2px var(--gold)}.pane{padding:16px}.pane h3{font:20px Georgia;color:#e9d9b2;margin-bottom:14px}.chatlog{height:320px;overflow:auto;overflow-wrap:anywhere}.chat-message{margin-bottom:17px;font-size:13px;line-height:1.5}.chat-author{color:var(--gold);font-size:11px;display:flex;justify-content:space-between;margin-bottom:3px}.chat-compose{display:flex;gap:6px;border-top:1px solid #ffffff15;padding-top:12px}.chat-compose input{width:100%;font-size:13px;padding:10px}.chat-compose button{padding:8px 12px}.profile-row,.result-row{padding:12px 0;border-bottom:1px solid #ffffff10;font-size:12px;line-height:1.8}.profile-row strong,.result-row strong{color:var(--gold);font-size:14px}.profile-stats{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:8px}.profile-stats div{background:#193022;border-radius:8px;padding:7px}.profile-stats span{display:block;color:var(--muted);font-size:10px}.plus{color:var(--green)}.minus{color:#ffb0a0}.result-cards{display:flex;gap:4px;margin-top:8px}.result-cards .card{width:32px;height:46px;font-size:15px;padding:3px}.result-cards .card .suit{font-size:16px}.notes{padding:18px;font-size:11px;line-height:1.8;color:var(--muted);border-top:1px solid #ffffff10}.announcement{position:fixed;inset:0;background:#03130cc9;backdrop-filter:blur(7px);display:grid;place-items:center;z-index:100;padding:20px}.announcement-box{background:radial-gradient(ellipse at top,#2b4d35,#0f2218 65%);border:1px solid #cbb17a;border-radius:24px;padding:34px 24px;text-align:center;width:min(540px,100%);box-shadow:0 35px 100px #000b;max-height:85dvh;overflow:auto}.announcement-box h2{font:32px Georgia;color:#ffe8ac;margin:13px 0}.announcement-box p{white-space:pre-line;line-height:1.8;font-size:15px}.announcement-box button{margin-top:22px}.announcement-icon{font:48px Georgia;color:var(--gold)}.toast{position:fixed;left:50%;bottom:25px;transform:translateX(-50%);background:#493025;border:1px solid #b99762;color:#fff0df;padding:12px 20px;max-width:90%;border-radius:12px;z-index:200;font-size:13px;box-shadow:0 8px 25px #0009}.login{min-height:calc(100dvh - 100px);display:grid;place-items:center;padding:28px 20px}.login-box{max-width:430px;width:100%;background:linear-gradient(150deg,#203c2a,#0d1e14);border:1px solid #6b6742;border-radius:25px;padding:34px;box-shadow:0 30px 100px #0006}.login-box h2{font:38px Georgia;color:#efd99e;margin:12px 0}.login-box p{color:var(--muted);font-size:14px;line-height:1.7;margin-bottom:20px}.login-box label{font-size:12px;display:block;margin:16px 0 7px;color:#d8dec8}.login-box input{width:100%}.login-box button{width:100%;margin-top:22px}.login-art{height:95px;display:flex;justify-content:center;padding-top:10px}.login-art .card{width:54px;height:77px;font-size:25px}.login-art .card:first-child{transform:rotate(-14deg) translateX(8px)}.login-art .card:last-child{transform:rotate(12deg) translateX(-6px)}.login-foot{margin-top:17px;color:var(--muted);font-size:11px;text-align:center;line-height:1.7}
 @media(max-width:1050px){.layout{grid-template-columns:minmax(0,1fr) 260px;gap:14px;padding:18px 16px}.stage{height:590px}.seat{width:108px}.pot{font-size:22px}.card{width:39px;height:57px;font-size:19px;padding:4px}.board{gap:4px}.side .pane{padding:12px}}
@@ -1505,11 +1536,11 @@ MOBILE_HTML = r"""<!doctype html>
 </style></head><body>
 <header><div class="brand"><div class="brand-mark">♠</div><div><h1>CÍRCULO</h1><p>PÓKER & BLACKJACK · MESAS PRIVADAS</p></div></div><div class="top-actions"><div class="connection"><i class="dot" id="netDot"></i><span id="network">Red local</span></div><button class="leave quiet" id="leave" hidden>Salir</button></div></header>
 <section class="login" id="login"><form class="login-box" id="joinForm"><div class="eyebrow">Tu lugar en la mesa</div><h2>Una buena mano.<br>Buena compañía.</h2><p>Entra con tu nombre. El crupier reparte y la mesa hace el resto.</p><div class="login-art"><div class="card">A<span class="suit">♠</span></div><div class="card red">K<span class="suit">♥</span></div></div><label for="name">Tu nombre</label><input id="name" maxlength="24" autocomplete="nickname" required placeholder="¿Cómo te llamas?"><label for="pin">Clave de la mesa</label><input id="pin" maxlength="128" type="password" autocomplete="off" placeholder="Déjala vacía si no hay clave"><button class="gold" id="joinBtn">Entrar a la mesa →</button><div class="login-foot">Saldo inicial <strong id="initialBalance">S/ 10,000.00</strong> virtuales<br>Misma red Wi-Fi · Sin instalar aplicaciones</div></form></section>
-<div class="layout" id="game" hidden><main class="main"><div class="table-head"><div><div class="eyebrow" style="margin-bottom:7px">SALA PRIVADA · SIN LÍMITE</div><h2>Mesa de amigos</h2></div><div class="stakes"><span id="stakesLabel">Ciegas S/ 0.10 / 0.20</span><br><span id="handNo">Esperando jugadores</span></div></div>
+<div class="layout" id="game" hidden><main class="main"><div class="table-head"><div><div class="eyebrow" >SALA PRIVADA · SIN LÍMITE</div><h2>Mesa de amigos</h2></div><div class="stakes"><span id="stakesLabel">Ciegas S/ 0.10 / 0.20</span><br><span id="handNo">Esperando jugadores</span></div></div>
 <div class="stage" id="stage"><div class="felt"></div><div class="dealer" id="dealer" aria-label="Crupier virtual"><svg viewBox="0 0 64 80" role="img" aria-label="Crupier"><path fill="#17261f" stroke="#b5a16f" d="M4 79V64Q6 45 32 44Q59 45 60 64V79Z"/><path fill="#efead3" d="M22 46L32 65L43 46L38 80H26Z"/><path fill="#bd965e" d="M25 37h14v13L32 57l-7-7z"/><ellipse cx="32" cy="25" rx="15" ry="20" fill="#d9b483"/><path fill="#283023" d="M16 27V16Q19 0 34 3Q52 4 48 23L43 12Q28 22 19 17Z"/><path fill="#183126" d="M23 50l9 4-8 7zM41 50l-9 4 8 7z"/><circle cx="26" cy="26" r="1.5" fill="#383023"/><circle cx="38" cy="26" r="1.5" fill="#383023"/><path d="M27 35q5 4 10 0" fill="none" stroke="#876144" stroke-width="1.5"/><path fill="#cba96c" d="M7 73h12v3H7z"/></svg><span>CRUPIER</span></div><div class="deck" aria-hidden="true"></div><div class="center"><div class="pot-caption" id="potCaption">BOTE VIRTUAL</div><div class="pot" id="pot">S/ 0.00</div><div class="board" id="board"></div><div class="phase" id="phase">La mesa te espera</div></div><div class="chip-stack" id="potChips" hidden><i class="chip"></i><i class="chip"></i><i class="chip"></i></div><div id="seats"></div></div>
 <div class="turn-strip"><span id="turnText">Esperando el reparto</span><span id="clock">—</span></div><div class="timer"><i id="timerBar"></i></div>
 <section class="control-panel"><div class="hand-wallet"><div><h3>Tu saldo virtual</h3><div class="wallet" id="wallet">—</div></div><div class="my-cards" id="myCards"></div></div><div class="action-grid"><button class="danger" id="fold" disabled>Retirarme</button><button class="gold" id="call" disabled>Pasar</button><button id="allin" disabled>All-in</button></div><div class="raise-line"><label>S/ <input id="amount" inputmode="decimal" type="text" value="0.40" aria-label="Total de la apuesta en soles"></label><button class="gold" id="raise" disabled>Subir / apostar</button></div><div class="quick"><button data-quick="min">Mínima</button><button data-quick="half">½ bote</button><button data-quick="pot">Bote</button><button data-quick="100">S/ 100</button></div><div class="hint" id="hint">El importe es el total de tu apuesta en esta ronda.</div><div class="host-controls" id="hostControls" hidden><button class="gold" id="start">Repartir mano</button><button id="reset">Nueva partida</button></div></section></main>
-<aside class="side"><nav class="tabs"><button class="active" data-pane="chat">Chat <span id="unread"></span></button><button data-pane="results">Resultados</button><button data-pane="profiles">Perfiles</button></nav><section class="pane" id="pane-chat"><h3>La conversación</h3><div class="chatlog" id="chatLog" aria-live="polite"></div><form class="chat-compose" id="chatForm"><input id="chatInput" maxlength="300" placeholder="Escribe a la mesa…" aria-label="Mensaje al chat"><button class="gold" aria-label="Enviar mensaje">↑</button></form></section><section class="pane" id="pane-results" hidden><h3>Última mano</h3><div id="results" style="max-height:420px;overflow:auto">El resultado aparecerá aquí.</div></section><section class="pane" id="pane-profiles" hidden><h3>Los jugadores</h3><div id="profiles" style="max-height:460px;overflow:auto"></div></section><div class="notes">♠ &nbsp;Dinero virtual. Solo entre amigos.<br>Conserva esta página abierta durante la partida. Si un jugador se desconecta, termina la partida y se devuelven las apuestas pendientes.</div></aside></div>
+<aside class="side"><nav class="tabs"><button class="active" data-pane="chat">Chat <span id="unread"></span></button><button data-pane="results">Resultados</button><button data-pane="profiles">Perfiles</button></nav><section class="pane" id="pane-chat"><h3>La conversación</h3><div class="chatlog" id="chatLog" aria-live="polite"></div><form class="chat-compose" id="chatForm"><input id="chatInput" maxlength="300" placeholder="Escribe a la mesa…" aria-label="Mensaje al chat"><button class="gold" aria-label="Enviar mensaje">↑</button></form></section><section class="pane" id="pane-results" hidden><h3>Última mano</h3><div id="results">El resultado aparecerá aquí.</div></section><section class="pane" id="pane-profiles" hidden><h3>Los jugadores</h3><div id="profiles"></div></section><div class="notes">♠ &nbsp;Dinero virtual. Solo entre amigos.<br>Conserva esta página abierta durante la partida. Si un jugador se desconecta, termina la partida y se devuelven las apuestas pendientes.</div></aside></div>
 <div class="announcement" id="announcement" hidden role="dialog" aria-modal="true" aria-labelledby="announcementTitle"><div class="announcement-box"><div class="eyebrow" id="announcementBadge">EN LA MESA</div><div class="announcement-icon">♠</div><h2 id="announcementTitle"></h2><p id="announcementDetail"></p><button class="gold" id="dismiss">Volver a la mesa</button></div></div><div class="toast" id="toast" hidden role="status"></div>
 <script>
 'use strict';
@@ -1518,8 +1549,8 @@ let state=null, lastState=null, online=false, busy=false, polling=false, eventCu
 const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
 let roomMode='join', roomCode=(new URLSearchParams(location.search).get('mesa')||'').trim().toUpperCase(), roomTitle='', switching=false;
 const roomFields=node('div');
-const roomTabs=node('div');roomTabs.style.cssText='display:flex;gap:8px;margin-bottom:12px';
-for(const [mode,label] of [['join','Entrar con código'],['create','Crear mesa']]){const b=node('button',mode==='join'?'gold':'',label);b.type='button';b.style.cssText='margin-top:0;flex:1;padding:10px;font-size:13px';b.onclick=()=>{roomMode=mode;codeLabel.hidden=codeInput.hidden=mode==='create';titleLabel.hidden=titleInput.hidden=gameChoice.hidden=mode!=='create';$('joinBtn').textContent=mode==='create'?'Crear mi mesa →':'Entrar a esta mesa →';pinInput.minLength=mode==='create'?6:1;for(const x of roomTabs.children)x.classList.toggle('gold',x===b)};roomTabs.append(b)}
+const roomTabs=node('div','room-tabs');
+for(const [mode,label] of [['join','Entrar con código'],['create','Crear mesa']]){const b=node('button',mode==='join'?'gold':'',label);b.type='button';b.onclick=()=>{roomMode=mode;codeLabel.hidden=codeInput.hidden=mode==='create';titleLabel.hidden=titleInput.hidden=gameChoice.hidden=mode!=='create';$('joinBtn').textContent=mode==='create'?'Crear mi mesa →':'Entrar a esta mesa →';pinInput.minLength=mode==='create'?6:1;for(const x of roomTabs.children)x.classList.toggle('gold',x===b)};roomTabs.append(b)}
 const codeLabel=node('label','','Código de la mesa');codeLabel.htmlFor='roomCode';const codeInput=node('input');codeInput.id='roomCode';codeInput.maxLength=8;codeInput.placeholder='Ejemplo: AB7K9M2Q';codeInput.value=roomCode;codeInput.autocomplete='off';codeInput.style.textTransform='uppercase';
 const titleLabel=node('label','','Nombre de tu mesa');titleLabel.htmlFor='roomTitle';const titleInput=node('input');titleInput.id='roomTitle';titleInput.maxLength=40;titleInput.placeholder='Por ejemplo: Los amigos';titleLabel.hidden=titleInput.hidden=true;
 const gameChoice=node('div');gameChoice.hidden=true;gameChoice.className='game-choice';let selectedGame='poker';
@@ -1528,9 +1559,9 @@ roomFields.append(roomTabs,gameChoice,codeLabel,codeInput,titleLabel,titleInput)
 const pinInput=$('pin');pinInput.required=true;pinInput.placeholder='Clave privada de esta mesa';$('joinBtn').textContent='Entrar a esta mesa →';
 document.querySelector('.login-box p').textContent='Crea tu propia mesa o entra con el código y la clave que te compartieron.';
 document.querySelector('.login-foot').lastChild.textContent='Salas privadas · Sin instalar aplicaciones';
-const invitation=node('section');invitation.style.cssText='margin:12px 4px;padding:14px;border:1px solid #72603e;border-radius:12px;overflow-wrap:anywhere';
+const invitation=node('section','invitation');
 invitation.append(node('strong','','Invita a tu mesa'),node('div','muted','Comparte el enlace y envía la clave por separado.'));
-const invitationCode=node('div');invitationCode.style.cssText='font-size:22px;color:var(--gold);letter-spacing:3px;margin:8px 0';
+const invitationCode=node('div','invitation-code');
 const inviteLink=node('input');inviteLink.readOnly=true;inviteLink.setAttribute('aria-label','Enlace de invitación');inviteLink.style.width='100%';
 const copyInvite=node('button','','Copiar invitación');copyInvite.type='button';copyInvite.style.marginTop='8px';copyInvite.onclick=async()=>{try{await navigator.clipboard.writeText(inviteLink.value);showToast('Enlace copiado. Comparte la clave por separado.')}catch{inviteLink.focus();inviteLink.select();showToast('Mantén pulsado el enlace y elige Copiar.')}};
 invitation.append(invitationCode,inviteLink,copyInvite);document.querySelector('.main').prepend(invitation);invitation.hidden=true;
@@ -2286,7 +2317,7 @@ def run_tests():
                 a = hub.sessions[sid]
                 self.assertEqual(result["state"]["game_kind"], "blackjack")
                 code = result["room"]["code"]
-                _, sid2 = hub.enter_room(False, dict(name="Dealer", pin="secret12", code=code), None, None)
+                _, sid2 = hub.enter_room(False, dict(name="Diego", pin="secret12", code=code), None, None)
                 b = hub.sessions[sid2]
                 st = wait(b, lambda s: len(s["players"]) == 2)
                 b.client.send(dict(type="action", action="dealer", revision=st["revision"]))
@@ -2355,7 +2386,11 @@ def run_tests():
                 self.assertEqual(status, 200)
                 nonce = re.search(r'<script nonce="([^"]+)"', page).group(1)
                 self.assertIn("'nonce-" + nonce + "'", headers["Content-Security-Policy"])
-                self.assertNotIn("unsafe-inline", headers["Content-Security-Policy"].split("script-src")[1].split(";")[0])
+                self.assertNotIn("unsafe-inline", headers["Content-Security-Policy"])
+                self.assertIn(f'<style nonce="{nonce}">', page)
+                self.assertIn("style-src-attr 'none'", headers["Content-Security-Policy"])
+                self.assertNotRegex(page, r'\sstyle="')
+                self.assertNotIn(".style.cssText", page)
                 self.assertEqual(headers["X-Frame-Options"], "DENY")
                 self.assertIn("camera=()", headers["Permissions-Policy"])
                 self.assertIn("max-age", headers["Strict-Transport-Security"])
@@ -2372,6 +2407,87 @@ def run_tests():
                 with hub.admission_lock:
                     hub.admissions.extend([time.monotonic()] * 60)
                 self.assertEqual(request("/api/rooms/join", "{}")[0], 429)
+            finally:
+                hub.stop()
+                server.stop()
+
+        def test_normalized_names_and_reserved_identities(self):
+            for cls in (Game, BlackjackGame):
+                g = cls()
+                self.assertEqual(g.add("  José\u202e \u200b Pérez  ").name, "José Pérez")
+                for name in ("Ｅｌ Ｃａｕｓａ", "él causa · IA", "El\u200b Causa", "ADMIN", "bot amigo", "\u202e", None, {}, "a" * 25):
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        g.add(name)
+                g.add("Ａna")
+                with self.assertRaises(ValueError):
+                    g.add("Ana")
+                self.assertEqual(len(g.players), 2)
+            self.assertEqual(safe_label("Mesa\u202e amigos", 40), "Mesa amigos")
+
+        def test_tampered_commands_preserve_bankroll_and_permissions(self):
+            from types import SimpleNamespace
+            from unittest.mock import Mock
+            server = Server(0)
+            try:
+                server.send = Mock()
+                server.broadcast = Mock()
+                g = server.game
+                g.add("Ana")
+                g.add("Luis")
+                guest = SimpleNamespace(pid=1, host=False)
+                for kind in ("start", "reset"):
+                    with self.assertRaises(ValueError):
+                        server.handle(guest, {"type": kind, "revision": g.revision, "host": True})
+                g.start()
+                actor = SimpleNamespace(pid=g.turn, host=False)
+                def stable_state():
+                    result = g.snapshot(actor.pid, False)
+                    result.pop("seconds")
+                    return result
+                before = stable_state()
+                for amount in (-1, True, None, "100", [], {}, 1.5, float("nan"), float("inf"), 10**1000):
+                    with self.subTest(amount=str(amount)[:30]), self.assertRaises(ValueError):
+                        server.handle(actor, {"type": "action", "action": "raise", "revision": g.revision, "amount": amount})
+                    self.assertEqual(stable_state(), before)
+                # An invented stack field is ignored; no direct balance setter exists.
+                server.handle(actor, {"type": "ping", "stack": 10**12, "host": True})
+                self.assertEqual(stable_state(), before)
+                packet = {"type": "action", "action": "raise", "amount": 100, "revision": g.revision, "stack": 10**12}
+                server.handle(actor, packet)
+                after = stable_state()
+                with self.assertRaises(ValueError):
+                    server.handle(actor, packet)
+                self.assertEqual(stable_state(), after)
+                self.assertEqual(sum(p.stack + p.total for p in g.players), 2 * STACK)
+            finally:
+                server.listener.close()
+                server.sel.close()
+
+        def test_security_admission_logs_do_not_expose_secrets(self):
+            import http.client
+            import io
+            from contextlib import redirect_stderr
+            server = Server(0, online=True)
+            server.start()
+            hub = WebHub(server, 0)
+            hub.start()
+            try:
+                result, sid = hub.enter_room(True, {"name": "Ana", "title": "Amigos", "pin": "secret-room"}, None, None)
+                code = result["room"]["code"]
+                stream = io.StringIO()
+                with redirect_stderr(stream):
+                    conn = http.client.HTTPConnection("127.0.0.1", hub.port, timeout=5)
+                    conn.request("POST", "/api/rooms/join", json.dumps({"name": "Private Name", "pin": "wrong-secret", "code": code}),
+                                 {"Content-Type": "application/json", "X-Poker": "1", "X-Forwarded-For": "forged-address"})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 400)
+                    response.read()
+                    conn.close()
+                event = json.loads(stream.getvalue())
+                self.assertEqual(event["event"], "admission_rejected")
+                self.assertEqual(event["peer"], "127.0.0.1")
+                for secret in (sid, code, "wrong-secret", "secret-room", "Private Name", "forged-address"):
+                    self.assertNotIn(secret, stream.getvalue())
             finally:
                 hub.stop()
                 server.stop()
@@ -2428,7 +2544,7 @@ def run_tests():
 
         def test_blackjack_roles_privacy_double_and_timeout(self):
             g = BlackjackGame()
-            a, b, dealer = [g.add(name) for name in ("A", "B", "Dealer")]
+            a, b, dealer = [g.add(name) for name in ("A", "B", "Diego")]
             g.action(dealer.pid, "dealer")
             with self.assertRaises(ValueError):
                 g.action(a.pid, "dealer")
